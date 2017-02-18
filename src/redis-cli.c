@@ -275,6 +275,10 @@ static void cliIntegrateHelp(void) {
      * don't already match what we have. */
     for (size_t j = 0; j < reply->elements; j++) {
         redisReply *entry = reply->element[j];
+        if (entry->type != REDIS_REPLY_ARRAY || entry->elements < 4 ||
+            entry->element[0]->type != REDIS_REPLY_STRING ||
+            entry->element[1]->type != REDIS_REPLY_INTEGER ||
+            entry->element[3]->type != REDIS_REPLY_INTEGER) return;
         char *cmdname = entry->element[0]->str;
         int i;
 
@@ -336,7 +340,7 @@ static void cliOutputGenericHelp(void) {
         "      \"help <tab>\" to get a list of possible help topics\n"
         "      \"quit\" to exit\n"
         "\n"
-        "To set redis-cli perferences:\n"
+        "To set redis-cli preferences:\n"
         "      \":set hints\" enable online hints\n"
         "      \":set nohints\" disable online hints\n"
         "Set your preferences in ~/.redisclirc\n",
@@ -1222,7 +1226,7 @@ static sds *cliSplitArgs(char *line, int *argc) {
     }
 }
 
-/* Set the CLI perferences. This function is invoked when an interactive
+/* Set the CLI preferences. This function is invoked when an interactive
  * ":command" is called, or when reading ~/.redisclirc file, in order to
  * set user preferences. */
 void cliSetPreferences(char **argv, int argc, int interactive) {
@@ -1257,6 +1261,7 @@ void cliLoadPreferences(void) {
             if (argc > 0) cliSetPreferences(argv,argc,0);
             sdsfreesplitres(argv,argc);
         }
+        fclose(fp);
     }
     sdsfree(rcfile);
 }
@@ -1267,6 +1272,11 @@ static void repl(void) {
     char *line;
     int argc;
     sds *argv;
+
+    /* Initialize the help and, if possible, use the COMMAND command in order
+     * to retrieve missing entries. */
+    cliInitHelp();
+    cliIntegrateHelp();
 
     config.interactive = 1;
     linenoiseSetMultiLine(1);
@@ -2600,11 +2610,6 @@ int main(int argc, char **argv) {
     firstarg = parseOptions(argc,argv);
     argc -= firstarg;
     argv += firstarg;
-
-    /* Initialize the help and, if possible, use the COMMAND command in order
-     * to retrieve missing entries. */
-    cliInitHelp();
-    cliIntegrateHelp();
 
     /* Latency mode */
     if (config.latency_mode) {
