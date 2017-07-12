@@ -1163,7 +1163,12 @@ int RM_ReplyWithDouble(RedisModuleCtx *ctx, double d) {
  * in the context of a command execution. EXEC will be handled by the
  * RedisModuleCommandDispatcher() function. */
 void moduleReplicateMultiIfNeeded(RedisModuleCtx *ctx) {
+    /* If we already emitted MULTI return ASAP. */
     if (ctx->flags & REDISMODULE_CTX_MULTI_EMITTED) return;
+    /* If this is a thread safe context, we do not want to wrap commands
+     * executed into MUTLI/EXEC, they are executed as single commands
+     * from an external client in essence. */
+    if (ctx->flags & REDISMODULE_CTX_THREAD_SAFE) return;
     execCommandPropagateMulti(ctx->client);
     ctx->flags |= REDISMODULE_CTX_MULTI_EMITTED;
 }
@@ -2512,6 +2517,7 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
 
     /* Setup our fake client for command execution. */
     c->flags |= CLIENT_MODULE;
+    c->db = ctx->client->db;
     c->argv = argv;
     c->argc = argc;
     c->cmd = c->lastcmd = cmd;
@@ -2705,11 +2711,13 @@ moduleType *moduleTypeLookupModuleByID(uint64_t id) {
 }
 
 /* Turn an (unresolved) module ID into a type name, to show the user an
- * error when RDB files contain module data we can't load. */
+ * error when RDB files contain module data we can't load.
+ * The buffer pointed by 'name' must be 10 bytes at least. The function will
+ * fill it with a null terminated module name. */
 void moduleTypeNameByID(char *name, uint64_t moduleid) {
     const char *cset = ModuleTypeNameCharSet;
 
-    name[0] = '\0';
+    name[9] = '\0';
     char *p = name+8;
     moduleid >>= 10;
     for (int j = 0; j < 9; j++) {
@@ -2877,25 +2885,36 @@ void moduleRDBLoadError(RedisModuleIO *io) {
  * data types. */
 void RM_SaveUnsigned(RedisModuleIO *io, uint64_t value) {
     if (io->error) return;
-    int retval = rdbSaveLen(io->rio, value);
-    if (retval == -1) {
-        io->error = 1;
-    } else {
-        io->bytes += retval;
-    }
+    /* Save opcode. */
+    int retval = rdbSaveLen(io->rio, RDB_MODULE_OPCODE_UINT);
+    if (retval == -1) goto saveerr;
+    io->bytes += retval;
+    /* Save value. */
+    retval = rdbSaveLen(io->rio, value);
+    if (retval == -1) goto saveerr;
+    io->bytes += retval;
+    return;
+
+saveerr:
+    io->error = 1;
 }
 
 /* Load an unsigned 64 bit value from the RDB file. This function should only
  * be called in the context of the rdb_load method of modules implementing
  * new data types. */
 uint64_t RM_LoadUnsigned(RedisModuleIO *io) {
+    if (io->ver == 2) {
+        uint64_t opcode = rdbLoadLen(io->rio,NULL);
+        if (opcode != RDB_MODULE_OPCODE_UINT) goto loaderr;
+    }
     uint64_t value;
     int retval = rdbLoadLenByRef(io->rio, NULL, &value);
-    if (retval == -1) {
-        moduleRDBLoadError(io);
-        return 0; /* Never reached. */
-    }
+    if (retval == -1) goto loaderr;
     return value;
+
+loaderr:
+    moduleRDBLoadError(io);
+    return 0; /* Never reached. */
 }
 
 /* Like RedisModule_SaveUnsigned() but for signed 64 bit values. */
@@ -2920,35 +2939,52 @@ int64_t RM_LoadSigned(RedisModuleIO *io) {
  * the RDB file. */
 void RM_SaveString(RedisModuleIO *io, RedisModuleString *s) {
     if (io->error) return;
-    int retval = rdbSaveStringObject(io->rio,s);
-    if (retval == -1) {
-        io->error = 1;
-    } else {
-        io->bytes += retval;
-    }
+    /* Save opcode. */
+    int retval = rdbSaveLen(io->rio, RDB_MODULE_OPCODE_STRING);
+    if (retval == -1) goto saveerr;
+    io->bytes += retval;
+    /* Save value. */
+    retval = rdbSaveStringObject(io->rio, s);
+    if (retval == -1) goto saveerr;
+    io->bytes += retval;
+    return;
+
+saveerr:
+    io->error = 1;
 }
 
 /* Like RedisModule_SaveString() but takes a raw C pointer and length
  * as input. */
 void RM_SaveStringBuffer(RedisModuleIO *io, const char *str, size_t len) {
     if (io->error) return;
-    int retval = rdbSaveRawString(io->rio,(unsigned char*)str,len);
-    if (retval == -1) {
-        io->error = 1;
-    } else {
-        io->bytes += retval;
-    }
+    /* Save opcode. */
+    int retval = rdbSaveLen(io->rio, RDB_MODULE_OPCODE_STRING);
+    if (retval == -1) goto saveerr;
+    io->bytes += retval;
+    /* Save value. */
+    retval = rdbSaveRawString(io->rio, (unsigned char*)str,len);
+    if (retval == -1) goto saveerr;
+    io->bytes += retval;
+    return;
+
+saveerr:
+    io->error = 1;
 }
 
 /* Implements RM_LoadString() and RM_LoadStringBuffer() */
 void *moduleLoadString(RedisModuleIO *io, int plain, size_t *lenptr) {
+    if (io->ver == 2) {
+        uint64_t opcode = rdbLoadLen(io->rio,NULL);
+        if (opcode != RDB_MODULE_OPCODE_STRING) goto loaderr;
+    }
     void *s = rdbGenericLoadStringObject(io->rio,
               plain ? RDB_LOAD_PLAIN : RDB_LOAD_NONE, lenptr);
-    if (s == NULL) {
-        moduleRDBLoadError(io);
-        return NULL; /* Never reached. */
-    }
+    if (s == NULL) goto loaderr;
     return s;
+
+loaderr:
+    moduleRDBLoadError(io);
+    return NULL; /* Never reached. */
 }
 
 /* In the context of the rdb_load method of a module data type, loads a string
@@ -2980,49 +3016,131 @@ char *RM_LoadStringBuffer(RedisModuleIO *io, size_t *lenptr) {
  * It is possible to load back the value with RedisModule_LoadDouble(). */
 void RM_SaveDouble(RedisModuleIO *io, double value) {
     if (io->error) return;
-    int retval = rdbSaveBinaryDoubleValue(io->rio, value);
-    if (retval == -1) {
-        io->error = 1;
-    } else {
-        io->bytes += retval;
-    }
+    /* Save opcode. */
+    int retval = rdbSaveLen(io->rio, RDB_MODULE_OPCODE_DOUBLE);
+    if (retval == -1) goto saveerr;
+    io->bytes += retval;
+    /* Save value. */
+    retval = rdbSaveBinaryDoubleValue(io->rio, value);
+    if (retval == -1) goto saveerr;
+    io->bytes += retval;
+    return;
+
+saveerr:
+    io->error = 1;
 }
 
 /* In the context of the rdb_save method of a module data type, loads back the
  * double value saved by RedisModule_SaveDouble(). */
 double RM_LoadDouble(RedisModuleIO *io) {
+    if (io->ver == 2) {
+        uint64_t opcode = rdbLoadLen(io->rio,NULL);
+        if (opcode != RDB_MODULE_OPCODE_DOUBLE) goto loaderr;
+    }
     double value;
     int retval = rdbLoadBinaryDoubleValue(io->rio, &value);
-    if (retval == -1) {
-        moduleRDBLoadError(io);
-        return 0; /* Never reached. */
-    }
+    if (retval == -1) goto loaderr;
     return value;
+
+loaderr:
+    moduleRDBLoadError(io);
+    return 0; /* Never reached. */
 }
 
-/* In the context of the rdb_save method of a module data type, saves a float 
+/* In the context of the rdb_save method of a module data type, saves a float
  * value to the RDB file. The float can be a valid number, a NaN or infinity.
  * It is possible to load back the value with RedisModule_LoadFloat(). */
 void RM_SaveFloat(RedisModuleIO *io, float value) {
     if (io->error) return;
-    int retval = rdbSaveBinaryFloatValue(io->rio, value);
-    if (retval == -1) {
-        io->error = 1;
-    } else {
-        io->bytes += retval;
-    }
+    /* Save opcode. */
+    int retval = rdbSaveLen(io->rio, RDB_MODULE_OPCODE_FLOAT);
+    if (retval == -1) goto saveerr;
+    io->bytes += retval;
+    /* Save value. */
+    retval = rdbSaveBinaryFloatValue(io->rio, value);
+    if (retval == -1) goto saveerr;
+    io->bytes += retval;
+    return;
+
+saveerr:
+    io->error = 1;
 }
 
 /* In the context of the rdb_save method of a module data type, loads back the
  * float value saved by RedisModule_SaveFloat(). */
 float RM_LoadFloat(RedisModuleIO *io) {
+    if (io->ver == 2) {
+        uint64_t opcode = rdbLoadLen(io->rio,NULL);
+        if (opcode != RDB_MODULE_OPCODE_FLOAT) goto loaderr;
+    }
     float value;
     int retval = rdbLoadBinaryFloatValue(io->rio, &value);
-    if (retval == -1) {
-        moduleRDBLoadError(io);
-        return 0; /* Never reached. */
-    }
+    if (retval == -1) goto loaderr;
     return value;
+
+loaderr:
+    moduleRDBLoadError(io);
+    return 0; /* Never reached. */
+}
+
+/* --------------------------------------------------------------------------
+ * Key digest API (DEBUG DIGEST interface for modules types)
+ * -------------------------------------------------------------------------- */
+
+/* Add a new element to the digest. This function can be called multiple times
+ * one element after the other, for all the elements that constitute a given
+ * data structure. The function call must be followed by the call to
+ * `RedisModule_DigestEndSequence` eventually, when all the elements that are
+ * always in a given order are added. See the Redis Modules data types
+ * documentation for more info. However this is a quick example that uses Redis
+ * data types as an example.
+ *
+ * To add a sequence of unordered elements (for example in the case of a Redis
+ * Set), the pattern to use is:
+ *
+ * foreach element {
+ *     AddElement(element);
+ *     EndSequence();
+ * }
+ *
+ * Because Sets are not ordered, so every element added has a position that
+ * does not depend from the other. However if instead our elements are
+ * ordered in pairs, like field-value pairs of an Hash, then one should
+ * use:
+ *
+ * foreach key,value {
+ *     AddElement(key);
+ *     AddElement(value);
+ *     EndSquence();
+ * }
+ *
+ * Because the key and value will be always in the above order, while instead
+ * the single key-value pairs, can appear in any position into a Redis hash.
+ *
+ * A list of ordered elements would be implemented with:
+ *
+ * foreach element {
+ *     AddElement(element);
+ * }
+ * EndSequence();
+ *
+ */
+void RM_DigestAddStringBuffer(RedisModuleDigest *md, unsigned char *ele, size_t len) {
+    mixDigest(md->o,ele,len);
+}
+
+/* Like `RedisModule_DigestAddStringBuffer()` but takes a long long as input
+ * that gets converted into a string before adding it to the digest. */
+void RM_DigestAddLongLong(RedisModuleDigest *md, long long ll) {
+    char buf[LONG_STR_SIZE];
+    size_t len = ll2string(buf,sizeof(buf),ll);
+    mixDigest(md->o,buf,len);
+}
+
+/* See the doucmnetation for `RedisModule_DigestAddElement()`. */
+void RM_DigestEndSequence(RedisModuleDigest *md) {
+    xorDigest(md->x,md->o,sizeof(md->o));
+    memset(md->o,0,sizeof(md->o));
 }
 
 /* --------------------------------------------------------------------------
@@ -3186,6 +3304,11 @@ void moduleBlockedClientPipeReadable(aeEventLoop *el, int fd, void *privdata, in
 void unblockClientFromModule(client *c) {
     RedisModuleBlockedClient *bc = c->bpop.module_blocked_handle;
     bc->client = NULL;
+    /* Reset the client for a new query since, for blocking commands implemented
+     * into modules, we do not it immediately after the command returns (and
+     * the client blocks) in order to be still able to access the argument
+     * vector from callbacks. */
+    resetClient(c);
 }
 
 /* Block a client in the context of a blocking command, returning an handle
@@ -3304,6 +3427,7 @@ void moduleHandleBlockedClients(void) {
                                  bc->reply_client->bufpos);
             if (listLength(bc->reply_client->reply))
                 listJoin(c->reply,bc->reply_client->reply);
+            c->reply_bytes += bc->reply_client->reply_bytes;
         }
         freeClient(bc->reply_client);
 
@@ -3785,4 +3909,7 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(FreeThreadSafeContext);
     REGISTER_API(ThreadSafeContextLock);
     REGISTER_API(ThreadSafeContextUnlock);
+    REGISTER_API(DigestAddStringBuffer);
+    REGISTER_API(DigestAddLongLong);
+    REGISTER_API(DigestEndSequence);
 }
