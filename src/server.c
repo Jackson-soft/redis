@@ -276,7 +276,7 @@ struct redisCommand redisCommandTable[] = {
     {"readonly",readonlyCommand,1,"F",0,NULL,0,0,0,0,0},
     {"readwrite",readwriteCommand,1,"F",0,NULL,0,0,0,0,0},
     {"dump",dumpCommand,2,"r",0,NULL,1,1,1,0,0},
-    {"object",objectCommand,3,"r",0,NULL,2,2,2,0,0},
+    {"object",objectCommand,-2,"r",0,NULL,2,2,2,0,0},
     {"memory",memoryCommand,-2,"r",0,NULL,0,0,0,0,0},
     {"client",clientCommand,-2,"as",0,NULL,0,0,0,0,0},
     {"eval",evalCommand,-3,"s",0,evalGetKeys,0,0,0,0,0},
@@ -2265,8 +2265,9 @@ void call(client *c, int flags) {
                 propagate_flags &= ~PROPAGATE_AOF;
 
         /* Call propagate() only if at least one of AOF / replication
-         * propagation is needed. */
-        if (propagate_flags != PROPAGATE_NONE)
+         * propagation is needed. Note that modules commands handle replication
+         * in an explicit way, so we never replicate them automatically. */
+        if (propagate_flags != PROPAGATE_NONE && !(c->cmd->flags & CMD_MODULE))
             propagate(c->cmd,c->db->id,c->argv,c->argc,propagate_flags);
     }
 
@@ -3539,7 +3540,8 @@ void loadDataFromDisk(void) {
                 rsi.repl_id_is_set &&
                 rsi.repl_offset != -1 &&
                 /* Note that older implementations may save a repl_stream_db
-                 * of -1 inside the RDB file. */
+                 * of -1 inside the RDB file in a wrong way, see more information
+                 * in function rdbPopulateSaveInfo. */
                 rsi.repl_stream_db != -1)
             {
                 memcpy(server.replid,rsi.repl_id,sizeof(server.replid));
