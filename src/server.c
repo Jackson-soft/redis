@@ -276,7 +276,7 @@ struct redisCommand redisCommandTable[] = {
     {"readonly",readonlyCommand,1,"F",0,NULL,0,0,0,0,0},
     {"readwrite",readwriteCommand,1,"F",0,NULL,0,0,0,0,0},
     {"dump",dumpCommand,2,"r",0,NULL,1,1,1,0,0},
-    {"object",objectCommand,-2,"r",0,NULL,2,2,2,0,0},
+    {"object",objectCommand,-2,"r",0,NULL,2,2,1,0,0},
     {"memory",memoryCommand,-2,"r",0,NULL,0,0,0,0,0},
     {"client",clientCommand,-2,"as",0,NULL,0,0,0,0,0},
     {"eval",evalCommand,-3,"s",0,evalGetKeys,0,0,0,0,0},
@@ -307,6 +307,12 @@ struct redisCommand redisCommandTable[] = {
     {"xrevrange",xrevrangeCommand,-4,"r",0,NULL,1,1,1,0,0},
     {"xlen",xlenCommand,2,"rF",0,NULL,1,1,1,0,0},
     {"xread",xreadCommand,-3,"rs",0,xreadGetKeys,1,1,1,0,0},
+    {"xreadgroup",xreadCommand,-3,"ws",0,xreadGetKeys,1,1,1,0,0},
+    {"xgroup",xgroupCommand,-2,"wm",0,NULL,2,2,1,0,0},
+    {"xack",xackCommand,-3,"wF",0,NULL,1,1,1,0,0},
+    {"xpending",xpendingCommand,-3,"r",0,NULL,1,1,1,0,0},
+    {"xclaim",xclaimCommand,-5,"wF",0,NULL,1,1,1,0,0},
+    {"xinfo",xinfoCommand,-2,"r",0,NULL,1,1,1,0,0},
     {"post",securityWarningCommand,-1,"lt",0,NULL,0,0,0,0,0},
     {"host:",securityWarningCommand,-1,"lt",0,NULL,0,0,0,0,0},
     {"latency",latencyCommand,-2,"aslt",0,NULL,0,0,0,0,0}
@@ -1451,6 +1457,7 @@ void initServerConfig(void) {
     server.cluster_migration_barrier = CLUSTER_DEFAULT_MIGRATION_BARRIER;
     server.cluster_slave_validity_factor = CLUSTER_DEFAULT_SLAVE_VALIDITY;
     server.cluster_require_full_coverage = CLUSTER_DEFAULT_REQUIRE_FULL_COVERAGE;
+    server.cluster_slave_no_failover = CLUSTER_DEFAULT_SLAVE_NO_FAILOVER;
     server.cluster_configfile = zstrdup(CONFIG_DEFAULT_CLUSTER_CONFIG_FILE);
     server.cluster_announce_ip = CONFIG_DEFAULT_CLUSTER_ANNOUNCE_IP;
     server.cluster_announce_port = CONFIG_DEFAULT_CLUSTER_ANNOUNCE_PORT;
@@ -1531,6 +1538,7 @@ void initServerConfig(void) {
     server.execCommand = lookupCommandByCString("exec");
     server.expireCommand = lookupCommandByCString("expire");
     server.pexpireCommand = lookupCommandByCString("pexpire");
+    server.xclaimCommand = lookupCommandByCString("xclaim");
 
     /* Slow log */
     server.slowlog_log_slower_than = CONFIG_DEFAULT_SLOWLOG_LOG_SLOWER_THAN;

@@ -59,7 +59,6 @@ typedef long long mstime_t; /* millisecond time type. */
 #include "anet.h"    /* Networking the easy way */
 #include "ziplist.h" /* Compact list data structure */
 #include "intset.h"  /* Compact integer set structure */
-#include "stream.h"  /* Stream data type header file. */
 #include "version.h" /* Version macro */
 #include "util.h"    /* Misc functions useful in many places */
 #include "latency.h" /* Latency monitor API */
@@ -653,7 +652,8 @@ typedef struct blockingState {
 
     /* BLOCK_STREAM */
     size_t xread_count;     /* XREAD COUNT option. */
-    robj *xread_group;      /* XREAD group name. */
+    robj *xread_group;      /* XREADGROUP group name. */
+    robj *xread_consumer;   /* XREADGROUP consumer name. */
     mstime_t xread_retry_time, xread_retry_ttl;
 
     /* BLOCKED_WAIT */
@@ -943,8 +943,8 @@ struct redisServer {
     off_t loading_process_events_interval_bytes;
     /* Fast pointers to often looked up command */
     struct redisCommand *delCommand, *multiCommand, *lpushCommand, *lpopCommand,
-                        *rpopCommand, *sremCommand, *execCommand, *expireCommand,
-                        *pexpireCommand;
+                        *rpopCommand, *sremCommand, *execCommand,
+                        *expireCommand, *pexpireCommand, *xclaimCommand;
     /* Fields used only for stats */
     time_t stat_starttime;          /* Server start time */
     long long stat_numcommands;     /* Number of processed commands */
@@ -1174,6 +1174,8 @@ struct redisServer {
     int cluster_slave_validity_factor; /* Slave max data age for failover. */
     int cluster_require_full_coverage; /* If true, put the cluster down if
                                           there is at least an uncovered slot.*/
+    int cluster_slave_no_failover;  /* Prevent slave from starting a failover
+                                       if the master is in failure state. */
     char *cluster_announce_ip;  /* IP address to announce on cluster bus. */
     int cluster_announce_port;     /* base port to announce on cluster bus. */
     int cluster_announce_bus_port; /* bus port to announce on cluster bus. */
@@ -1294,6 +1296,8 @@ typedef struct {
     dictIterator *di;
     dictEntry *de;
 } hashTypeIterator;
+
+#include "stream.h"  /* Stream data type header file. */
 
 #define OBJ_HASH_KEY 1
 #define OBJ_HASH_VALUE 2
@@ -2022,6 +2026,11 @@ void xrangeCommand(client *c);
 void xrevrangeCommand(client *c);
 void xlenCommand(client *c);
 void xreadCommand(client *c);
+void xgroupCommand(client *c);
+void xackCommand(client *c);
+void xpendingCommand(client *c);
+void xclaimCommand(client *c);
+void xinfoCommand(client *c);
 
 #if defined(__GNUC__)
 void *calloc(size_t count, size_t size) __attribute__ ((deprecated));
