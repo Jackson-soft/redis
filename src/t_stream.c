@@ -686,8 +686,11 @@ void streamPropagateXCLAIM(client *c, robj *key, robj *group, robj *id, streamNA
     /* We need to generate an XCLAIM that will work in a idempotent fashion:
      *
      * XCLAIM <key> <group> <consumer> 0 <id> TIME <milliseconds-unix-time>
-     *        RETRYCOUNT <count> [FORCE]. */
-    robj *argv[11];
+     *        RETRYCOUNT <count> FORCE JUSTID.
+     *
+     * Note that JUSTID is useful in order to avoid that XCLAIM will do
+     * useless work in the slave side, trying to fetch the stream item. */
+    robj *argv[12];
     argv[0] = createStringObject("XCLAIM",6);
     argv[1] = key;
     argv[2] = group;
@@ -699,7 +702,8 @@ void streamPropagateXCLAIM(client *c, robj *key, robj *group, robj *id, streamNA
     argv[8] = createStringObject("RETRYCOUNT",10);
     argv[9] = createStringObjectFromLongLong(nack->delivery_count);
     argv[10] = createStringObject("FORCE",5);
-    propagate(server.xclaimCommand,c->db->id,argv,10,PROPAGATE_AOF|PROPAGATE_REPL);
+    argv[11] = createStringObject("JUSTID",6);
+    propagate(server.xclaimCommand,c->db->id,argv,12,PROPAGATE_AOF|PROPAGATE_REPL);
     decrRefCount(argv[0]);
     decrRefCount(argv[3]);
     decrRefCount(argv[4]);
@@ -708,6 +712,7 @@ void streamPropagateXCLAIM(client *c, robj *key, robj *group, robj *id, streamNA
     decrRefCount(argv[8]);
     decrRefCount(argv[9]);
     decrRefCount(argv[10]);
+    decrRefCount(argv[11]);
 }
 
 /* Send the specified range to the client 'c'. The range the client will
@@ -1496,6 +1501,7 @@ NULL
         streamCG *cg = streamCreateCG(s,grpname,sdslen(grpname),&id);
         if (cg) {
             addReply(c,shared.ok);
+            server.dirty++;
         } else {
             addReplySds(c,
                 sdsnew("-BUSYGROUP Consumer Group name already exists\r\n"));
@@ -1507,6 +1513,7 @@ NULL
          * that were yet associated with such a consumer. */
         long long pending = streamDelConsumer(cg,c->argv[4]->ptr);
         addReplyLongLong(c,pending);
+        server.dirty++;
     } else if (!strcasecmp(opt,"HELP")) {
         addReplyHelp(c, help);
     } else {
@@ -1553,6 +1560,7 @@ void xackCommand(client *c) {
             raxRemove(nack->consumer->pel,buf,sizeof(buf),NULL);
             streamFreeNACK(nack);
             acknowledged++;
+            server.dirty++;
         }
     }
     addReplyLongLong(c,acknowledged);
@@ -1920,34 +1928,52 @@ void xclaimCommand(client *c) {
     preventCommandPropagation(c);
 }
 
-/* XINFO <key> [CONSUMERS group|GROUPS|STREAM]. STREAM is the default */
+/* XINFO CONSUMERS key group
+ * XINFO GROUPS <key>
+ * XINFO STREAM <key>
+ * XINFO <key> (alias of XINFO STREAM key)
+ * XINFO HELP. */
 void xinfoCommand(client *c) {
     const char *help[] = {
-"<key> CONSUMERS <groupname>  -- Show consumer groups of group <groupname>.",
-"<key> GROUPS                 -- Show the stream consumer groups.",
-"<key> STREAM                 -- Show information about the stream.",
-"<key> (without subcommand)   -- Alias for <key> STREAM.",
-"<key> HELP                   -- Prints this help.",
+"CONSUMERS <key> <groupname>  -- Show consumer groups of group <groupname>.",
+"GROUPS <key>                 -- Show the stream consumer groups.",
+"STREAM <key>                 -- Show information about the stream.",
+"<key>                        -- Alias for STREAM <key>.",
+"HELP                         -- Print this help.",
 NULL
     };
     stream *s = NULL;
-    char *opt = c->argc > 2 ? c->argv[2]->ptr : "STREAM"; /* Subcommand. */
+    char *opt;
+    robj *key;
+
+    /* HELP is special. Handle it ASAP. */
+    if (!strcasecmp(c->argv[1]->ptr,"HELP")) {
+        addReplyHelp(c, help);
+        return;
+    }
+
+    /* Handle the fact that no subcommand means "STREAM". */
+    if (c->argc == 2) {
+        opt = "STREAM";
+        key = c->argv[1];
+    } else {
+        opt = c->argv[1]->ptr;
+        key = c->argv[2];
+    }
 
     /* Lookup the key now, this is common for all the subcommands but HELP. */
-    if (c->argc >= 2 && strcasecmp(opt,"HELP")) {
-        robj *o = lookupKeyWriteOrReply(c,c->argv[1],shared.nokeyerr);
-        if (o == NULL) return;
-        s = o->ptr;
-    }
+    robj *o = lookupKeyWriteOrReply(c,key,shared.nokeyerr);
+    if (o == NULL) return;
+    s = o->ptr;
 
     /* Dispatch the different subcommands. */
     if (!strcasecmp(opt,"CONSUMERS") && c->argc == 4) {
-        /* XINFO <key> CONSUMERS <group>. */
+        /* XINFO CONSUMERS <key> <group>. */
         streamCG *cg = streamLookupCG(s,c->argv[3]->ptr);
         if (cg == NULL) {
             addReplyErrorFormat(c, "-NOGROUP No such consumer group '%s' "
                                    "for key name '%s'",
-                                   c->argv[3]->ptr, c->argv[1]->ptr);
+                                   c->argv[3]->ptr, key->ptr);
             return;
         }
 
@@ -1971,7 +1997,7 @@ NULL
         }
         raxStop(&ri);
     } else if (!strcasecmp(opt,"GROUPS") && c->argc == 3) {
-        /* XINFO <key> GROUPS. */
+        /* XINFO GROUPS <key>. */
         if (s->cgroups == NULL) {
             addReplyMultiBulkLen(c,0);
             return;
@@ -1995,7 +2021,7 @@ NULL
     } else if (c->argc == 2 ||
                (!strcasecmp(opt,"STREAM") && c->argc == 3))
     {
-        /* XINFO <key> STREAM (or the alias XINFO <key>). */
+        /* XINFO STREAM <key> (or the alias XINFO <key>). */
         addReplyMultiBulkLen(c,12);
         addReplyStatus(c,"length");
         addReplyLongLong(c,s->length);
@@ -2020,10 +2046,8 @@ NULL
         count = streamReplyWithRange(c,s,&start,&end,1,1,NULL,NULL,
                                      STREAM_RWR_RAWENTRIES,NULL);
         if (!count) addReply(c,shared.nullbulk);
-    } else if (!strcasecmp(opt,"HELP")) {
-        addReplyHelp(c, help);
     } else {
-        addReplyError(c,"syntax error, try 'XINFO anykey HELP'");
+        addReplyError(c,"syntax error, try 'XINFO HELP'");
     }
 }
 
